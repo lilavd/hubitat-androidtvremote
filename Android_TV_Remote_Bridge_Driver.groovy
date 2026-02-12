@@ -26,7 +26,7 @@ metadata {
         name: "Android TV Remote (Bridge)",
         namespace: "community",
         author: "Community Driver",
-        importUrl: ""
+        importUrl: "https://raw.githubusercontent.com/yourrepo/android-tv-remote-hubitat/main/drivers/Android_TV_Remote_Bridge_Driver.groovy"
     ) {
         capability "Switch"
         capability "SwitchLevel"
@@ -77,6 +77,7 @@ metadata {
         // Pairing
         command "startPairing"
         command "completePairing", [[name:"code*", type:"STRING"]]
+        command "unpair"
         
         // Connection
         command "connect"
@@ -93,6 +94,7 @@ metadata {
     
     preferences {
         input name: "deviceIP", type: "text", title: "Android TV IP Address", required: true
+        input name: "deviceMAC", type: "text", title: "Android TV MAC Address (for Wake-on-LAN)", description: "Format: AA:BB:CC:DD:EE:FF", required: false
         input name: "bridgeIP", type: "text", title: "Bridge Server IP", required: true
         input name: "bridgePort", type: "number", title: "Bridge Server Port", defaultValue: 3000
         input name: "deviceId", type: "text", title: "Device ID", description: "Unique ID for this TV", required: true
@@ -161,9 +163,12 @@ def initialize() {
     // Check pairing status
     if (state.certificate && state.privateKey) {
         sendEvent(name: "paired", value: "true")
-        if (autoConnect) {
-            runIn(3, connect)
-        }
+        
+        // Check if already connected on bridge
+        runIn(3, getStatus)
+        
+        // Schedule periodic status checks (every 60 seconds)
+        schedule("0 * * * * ?", getStatus)
     } else {
         sendEvent(name: "paired", value: "false")
         log.warn "Device not paired - use startPairing command"
@@ -174,6 +179,14 @@ def refresh() {
     if (logEnable) log.debug "Refreshing status"
     checkBridge()
     getStatus()
+    
+    if (txtEnable) {
+        def bridgeStatus = device.currentValue("bridgeStatus")
+        def connectionStatus = device.currentValue("connectionStatus")
+        def paired = device.currentValue("paired")
+        
+        log.info "Status - Bridge: ${bridgeStatus}, Connection: ${connectionStatus}, Paired: ${paired}"
+    }
 }
 
 // Bridge Communication
@@ -206,11 +219,14 @@ def checkBridge() {
 }
 
 private Map callBridge(String endpoint, Map body = null, String method = "POST") {
+    // Use longer timeout for pairing operations (30 seconds)
+    def timeout = endpoint.contains("/pair") ? 30 : 10
+    
     def params = [
         uri: getBridgeUrl(),
         path: endpoint,
         contentType: "application/json",
-        timeout: 10
+        timeout: timeout
     ]
     
     if (body) {
@@ -282,12 +298,23 @@ def disconnect() {
 }
 
 def getStatus() {
+    if (logEnable) log.debug "Getting device status from bridge"
+    
     def result = callBridge("/status/${deviceId}", null, "GET")
     
-    if (result?.connected) {
-        sendEvent(name: "connectionStatus", value: "connected")
+    if (result?.success) {
+        if (result.connected) {
+            sendEvent(name: "connectionStatus", value: "connected")
+            if (logEnable) log.debug "Status: Connected"
+        } else {
+            sendEvent(name: "connectionStatus", value: "disconnected")
+            if (logEnable) log.debug "Status: Disconnected"
+        }
     } else {
-        sendEvent(name: "connectionStatus", value: "disconnected")
+        // If we can't get status but bridge is online, assume disconnected
+        if (device.currentValue("bridgeStatus") == "online") {
+            sendEvent(name: "connectionStatus", value: "disconnected")
+        }
     }
 }
 
@@ -321,7 +348,7 @@ def startPairing() {
 
 def completePairing(String code) {
     if (!code || code.length() != 6) {
-        log.error "Invalid code - must be 6 digits"
+        log.error "Invalid code - must be 6 characters"
         return
     }
     
@@ -337,21 +364,59 @@ def completePairing(String code) {
         state.certificate = result.certificate
         state.privateKey = result.privateKey
         
+        log.debug "Certificate stored: ${state.certificate ? 'Yes' : 'No'}"
+        log.debug "Private key stored: ${state.privateKey ? 'Yes' : 'No'}"
+        
+        // Update paired status
         sendEvent(name: "paired", value: "true")
+        
+        // After successful pairing, device is already connected by the bridge
+        // Update connection status to reflect this
+        sendEvent(name: "connectionStatus", value: "connected")
         
         log.warn "=============================================="
         log.warn "PAIRING SUCCESSFUL!"
         log.warn "Credentials have been saved"
-        log.warn "Use connect() to establish connection"
+        log.warn "Device is now connected and ready to use"
+        log.warn "Paired: true"
+        log.warn "Connection: connected"
         log.warn "=============================================="
         
-        if (autoConnect) {
-            runIn(2, connect)
-        }
+        // Get initial status
+        runIn(2, getStatus)
+        
+        // Reinitialize to set up status checking schedule
+        runIn(3, initialize)
     } else {
         log.error "Pairing failed: ${result?.error}"
         sendEvent(name: "paired", value: "false")
+        sendEvent(name: "connectionStatus", value: "disconnected")
     }
+}
+
+def unpair() {
+    if (logEnable) log.debug "Unpairing device"
+    
+    // Call bridge to unpair
+    def result = callBridge("/unpair", [
+        deviceId: deviceId
+    ])
+    
+    // Clear local state
+    state.remove("certificate")
+    state.remove("privateKey")
+    
+    sendEvent(name: "paired", value: "false")
+    sendEvent(name: "connectionStatus", value: "disconnected")
+    
+    log.warn "=============================================="
+    log.warn "DEVICE UNPAIRED"
+    log.warn "Cleared from Hubitat and bridge"
+    log.warn "Also clear Android TV Remote Service data on TV:"
+    log.warn "Settings > Apps > Android TV Remote Service > Clear storage"
+    log.warn "=============================================="
+    
+    if (txtEnable) log.info "Device unpaired"
 }
 
 // Switch Capability
@@ -429,14 +494,88 @@ def unmute() {
 def powerToggle() { 
     pressKey("POWER")
     def current = device.currentValue("switch")
-    sendEvent(name: "switch", value: current == "on" ? "off" : "on")
-    sendEvent(name: "power", value: current == "on" ? "off" : "on")
+    def newState = current == "on" ? "off" : "on"
+    sendEvent(name: "switch", value: newState)
+    sendEvent(name: "power", value: newState)
+    
+    if (logEnable) log.debug "Power toggled to: ${newState}"
 }
-def sleep() { pressKey("SLEEP") }
-def wakeUp() { 
-    pressKey("WAKEUP")
+
+def sleep() { 
+    pressKey("SLEEP")
+    sendEvent(name: "switch", value: "off")
+    sendEvent(name: "power", value: "off")
+}
+
+def wakeUp() {
+    if (logEnable) log.debug "Attempting to wake TV"
+    
+    // Try Wake-on-LAN first if MAC address is configured
+    if (deviceMAC) {
+        if (logEnable) log.debug "Sending Wake-on-LAN magic packet to ${deviceMAC}"
+        sendWOL(deviceMAC)
+        pauseExecution(1000)
+    }
+    
+    // Method 1: Send POWER key (works if TV is in light sleep)
+    pressKey("POWER")
+    pauseExecution(500)
+    
+    // Method 2: Send HOME key (often more reliable for Android TV)
+    pressKey("HOME")
+    
+    // Update state optimistically
     sendEvent(name: "switch", value: "on")
     sendEvent(name: "power", value: "on")
+    
+    if (txtEnable) log.info "Wake commands sent to TV"
+}
+
+// Send Wake-on-LAN magic packet
+private void sendWOL(String mac) {
+    try {
+        def macBytes = mac.replaceAll("[:-]", "").decodeHex()
+        
+        if (macBytes.size() != 6) {
+            log.error "Invalid MAC address format: ${mac}"
+            return
+        }
+        
+        // Build magic packet: 6 bytes of FF + 16 repetitions of MAC
+        def packet = []
+        
+        // Fill first 6 bytes with 0xFF
+        for (int i = 0; i < 6; i++) {
+            packet << (byte) 0xFF
+        }
+        
+        // Repeat MAC address 16 times
+        for (int i = 0; i < 16; i++) {
+            packet.addAll(macBytes)
+        }
+        
+        // Convert to byte array
+        byte[] packetBytes = packet as byte[]
+        
+        // Convert to hex string for HubAction
+        def hexString = hubitat.helper.HexUtils.byteArrayToHexString(packetBytes)
+        
+        // Send broadcast packet
+        def hubAction = new hubitat.device.HubAction(
+            hexString,
+            hubitat.device.Protocol.LAN,
+            [type: hubitat.device.HubAction.Type.LAN_TYPE_UDPCLIENT,
+             destinationAddress: "255.255.255.255:9",
+             encoding: hubitat.device.HubAction.Encoding.HEX_STRING]
+        )
+        
+        sendHubCommand(hubAction)
+        
+        if (logEnable) log.debug "WOL magic packet sent to ${mac}"
+        
+    } catch (Exception e) {
+        log.error "Failed to send WOL packet: ${e.message}"
+    }
 }
 
 // App Control

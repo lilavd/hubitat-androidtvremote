@@ -1,0 +1,17 @@
+{
+  "name": "androidtv-bridge",
+  "version": "1.0.0",
+  "description": "Android TV Remote Bridge for Hubitat",
+  "main": "androidtv-bridge.js",
+  "dependencies": {
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "androidtv-remote": "^1.0.10"
+  },
+  "scripts": {
+    "start": "node androidtv-bridge.js"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

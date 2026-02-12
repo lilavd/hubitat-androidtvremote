@@ -1,154 +1,362 @@
 /**
- * Android TV Remote - Bridge Server
+ * Android TV Remote - Bridge Server (Complete Fix)
  * 
- * This Node.js server acts as a bridge between Hubitat and Android TV
- * It handles the complex Protocol Buffer and TLS requirements that
- * Hubitat's Groovy environment cannot natively support.
+ * Fixed: Body parsing issues, IPv6 problems, undefined errors
  * 
  * Install dependencies:
- * npm install express body-parser androidtvremote2
+ * npm install express body-parser androidtv-remote
  * 
  * Run:
  * node androidtv-bridge.js
- * 
- * Then configure Hubitat driver to point to this bridge's IP:port
  */
 
 const express = require('express');
 const bodyParser = require('body-parser');
-const { AndroidRemote } = require('androidtvremote2');
+const AndroidRemote = require('androidtv-remote').AndroidRemote;
+const RemoteKeyCode = require('androidtv-remote').RemoteKeyCode;
+const RemoteDirection = require('androidtv-remote').RemoteDirection;
 
 const app = express();
-app.use(bodyParser.json());
+
+// CRITICAL: Body parser middleware MUST be configured correctly
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.urlencoded({ extended: true }));
+
+// Add request logging middleware
+app.use((req, res, next) => {
+    console.log(`\n[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    if (req.body && Object.keys(req.body).length > 0) {
+        console.log('Request body:', JSON.stringify(req.body, null, 2));
+    }
+    next();
+});
 
 // Configuration
-const PORT = 3000;
-const devices = new Map(); // Store TV connections
+const PORT = process.env.PORT || 3000;
+const devices = new Map();
 
-// Helper function to get or create TV connection
-async function getDevice(deviceId, host, certFile, keyFile) {
-    if (!devices.has(deviceId)) {
-        console.log(`Creating new connection for device: ${deviceId}`);
-        const remote = new AndroidRemote(host, {
-            certFile: certFile,
-            keyFile: keyFile
-        });
-        devices.set(deviceId, remote);
-    }
-    return devices.get(deviceId);
-}
-
-// Pairing endpoint
+// Pairing endpoint - Step 1: Initiate pairing
 app.post('/pair/start', async (req, res) => {
+    console.log('\n=== PAIRING START REQUEST ===');
+    
     try {
-        const { deviceId, host, deviceName } = req.body;
+        // Extract and validate parameters
+        const deviceId = req.body.deviceId;
+        const host = req.body.host;
+        const deviceName = req.body.deviceName || 'Hubitat';
         
-        console.log(`Starting pairing for ${deviceId} at ${host}`);
+        // Validation
+        if (!deviceId) {
+            throw new Error('Missing required parameter: deviceId');
+        }
+        if (!host) {
+            throw new Error('Missing required parameter: host (TV IP address)');
+        }
         
-        const remote = new AndroidRemote(host, {
-            name: deviceName || 'Hubitat'
+        console.log(`Device ID: ${deviceId}`);
+        console.log(`TV Host: ${host}`);
+        console.log(`Device Name: ${deviceName}`);
+        
+        // Validate IP address format
+        const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
+        if (!ipRegex.test(host)) {
+            throw new Error(`Invalid IP address format: ${host}`);
+        }
+        
+        const options = {
+            pairing_port: 6467,
+            remote_port: 6466,
+            name: deviceName,
+            cert: {}
+        };
+        
+        console.log(`Creating AndroidRemote with options:`, JSON.stringify(options, null, 2));
+        
+        const remote = new AndroidRemote(host, options);
+        
+        // Store pairing state
+        const pairingState = {
+            remote: remote,
+            host: host,
+            deviceId: deviceId,
+            started: Date.now(),
+            codeDisplayed: false,
+            ready: false,
+            error: null
+        };
+        
+        // Set up event handlers with detailed logging
+        remote.on('secret', () => {
+            console.log(`[${deviceId}] ✓ SECRET event - Pairing code should be on TV now`);
+            pairingState.codeDisplayed = true;
         });
         
-        await remote.start();
-        const code = await remote.getPairingCode();
+        remote.on('ready', () => {
+            console.log(`[${deviceId}] ✓ READY event - Remote is ready`);
+            pairingState.ready = true;
+        });
         
-        // Store temporarily for completion
-        devices.set(`pairing_${deviceId}`, remote);
+        remote.on('error', (error) => {
+            console.error(`[${deviceId}] ✗ ERROR event:`, error.message);
+            pairingState.error = error.message;
+        });
+        
+        remote.on('unpaired', () => {
+            console.log(`[${deviceId}] ⚠ UNPAIRED event - Waiting for pairing code`);
+        });
+        
+        remote.on('powered', (powered) => {
+            console.log(`[${deviceId}] POWERED event: ${powered}`);
+        });
+        
+        // Store before starting
+        devices.set(`pairing_${deviceId}`, pairingState);
+        
+        console.log(`[${deviceId}] Starting remote.start()...`);
+        
+        // Start pairing
+        await remote.start();
+        
+        console.log(`[${deviceId}] ✓ remote.start() completed`);
+        
+        // Give it a brief moment for events to fire
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        console.log(`[${deviceId}] Pairing initiated successfully`);
+        console.log(`[${deviceId}] Code displayed: ${pairingState.codeDisplayed}`);
         
         res.json({
             success: true,
-            message: 'Pairing started - enter code on TV',
-            code: code
+            message: 'Pairing initiated - check TV for 6-digit code',
+            deviceId: deviceId,
+            codeDisplayed: pairingState.codeDisplayed
         });
         
     } catch (error) {
-        console.error('Pairing start error:', error);
+        console.error('✗ PAIRING START FAILED:', error.message);
+        console.error('Error details:', error);
+        
         res.status(500).json({
             success: false,
-            error: error.message
+            error: error.message || 'Failed to start pairing',
+            details: error.stack
         });
     }
 });
 
+// Pairing endpoint - Step 2: Submit code
 app.post('/pair/complete', async (req, res) => {
+    console.log('\n=== PAIRING COMPLETE REQUEST ===');
+    
     try {
-        const { deviceId, code } = req.body;
+        const deviceId = req.body.deviceId;
+        const code = req.body.code;
         
-        const remote = devices.get(`pairing_${deviceId}`);
-        if (!remote) {
-            throw new Error('No pairing in progress');
+        // Validation
+        if (!deviceId) {
+            throw new Error('Missing required parameter: deviceId');
+        }
+        if (!code) {
+            throw new Error('Missing required parameter: code');
         }
         
-        await remote.sendPairingCode(code);
+        console.log(`Device ID: ${deviceId}`);
+        console.log(`Code: ${code}`);
         
-        // Get certificates for storage
+        // Validate code format - can be alphanumeric (letters and numbers)
+        if (!/^[A-Z0-9]{6}$/i.test(code)) {
+            throw new Error('Code must be exactly 6 characters (letters or numbers)');
+        }
+        
+        // Convert to uppercase to ensure consistency
+        const upperCode = code.toUpperCase();
+        
+        const pairingState = devices.get(`pairing_${deviceId}`);
+        if (!pairingState) {
+            throw new Error(`No pairing in progress for device: ${deviceId}. Run /pair/start first.`);
+        }
+        
+        const remote = pairingState.remote;
+        
+        console.log(`[${deviceId}] Sending code to TV...`);
+        
+        // Send pairing code (use uppercase version)
+        await remote.sendCode(upperCode);
+        
+        console.log(`[${deviceId}] Code sent, waiting for pairing to complete...`);
+        
+        // Wait for pairing to complete
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        
+        console.log(`[${deviceId}] Getting certificate...`);
+        
+        // Get certificate
         const cert = remote.getCertificate();
-        const key = remote.getPrivateKey();
         
-        // Clean up temporary pairing connection
+        console.log(`[${deviceId}] Certificate obtained:`, cert ? 'Yes' : 'No');
+        
+        // Move from pairing to active devices
         devices.delete(`pairing_${deviceId}`);
+        devices.set(deviceId, { 
+            remote: remote, 
+            cert: cert,
+            host: pairingState.host,
+            connected: true,
+            lastActivity: Date.now()
+        });
+        
+        console.log(`[${deviceId}] ✓ Pairing completed successfully!`);
         
         res.json({
             success: true,
             message: 'Pairing successful',
-            certificate: cert.toString('base64'),
-            privateKey: key.toString('base64')
+            deviceId: deviceId,
+            certificate: JSON.stringify(cert),
+            privateKey: JSON.stringify(cert)
         });
         
     } catch (error) {
-        console.error('Pairing complete error:', error);
+        console.error('✗ PAIRING COMPLETE FAILED:', error.message);
+        console.error('Error details:', error);
+        
         res.status(500).json({
             success: false,
-            error: error.message
+            error: error.message || 'Pairing failed',
+            details: error.stack
         });
     }
 });
 
 // Connection management
 app.post('/connect', async (req, res) => {
+    console.log('\n=== CONNECT REQUEST ===');
+    
     try {
-        const { deviceId, host, certificate, privateKey } = req.body;
+        const deviceId = req.body.deviceId;
+        const host = req.body.host;
+        const certificate = req.body.certificate;
         
-        console.log(`Connecting to ${deviceId} at ${host}`);
+        // Validation
+        if (!deviceId) {
+            throw new Error('Missing required parameter: deviceId');
+        }
+        if (!host) {
+            throw new Error('Missing required parameter: host');
+        }
         
-        const certBuffer = Buffer.from(certificate, 'base64');
-        const keyBuffer = Buffer.from(privateKey, 'base64');
+        console.log(`Device ID: ${deviceId}`);
+        console.log(`Host: ${host}`);
+        console.log(`Has certificate: ${!!certificate}`);
         
-        const remote = new AndroidRemote(host, {
-            cert: certBuffer,
-            key: keyBuffer
+        // Check if already connected
+        const existing = devices.get(deviceId);
+        if (existing && existing.remote && existing.connected) {
+            console.log(`[${deviceId}] Already connected, reusing connection`);
+            res.json({
+                success: true,
+                message: 'Already connected'
+            });
+            return;
+        }
+        
+        let cert = {};
+        if (certificate) {
+            try {
+                cert = JSON.parse(certificate);
+                console.log(`[${deviceId}] Using stored certificate`);
+            } catch (e) {
+                console.warn(`[${deviceId}] Invalid certificate format, needs pairing`);
+            }
+        }
+        
+        const options = {
+            pairing_port: 6467,
+            remote_port: 6466,
+            name: 'Hubitat',
+            cert: cert
+        };
+        
+        const remote = new AndroidRemote(host, options);
+        
+        // Set up event handlers
+        remote.on('powered', (powered) => {
+            console.log(`[${deviceId}] TV powered: ${powered}`);
         });
         
+        remote.on('volume', (volume) => {
+            console.log(`[${deviceId}] Volume: ${volume.level}/${volume.maximum}, muted: ${volume.muted}`);
+        });
+        
+        remote.on('ready', () => {
+            console.log(`[${deviceId}] ✓ Connected and ready`);
+        });
+        
+        remote.on('error', (error) => {
+            console.error(`[${deviceId}] Error:`, error.message);
+        });
+        
+        remote.on('unpaired', () => {
+            console.warn(`[${deviceId}] ⚠ Device is unpaired - needs pairing`);
+        });
+        
+        // Start connection
+        console.log(`[${deviceId}] Starting connection...`);
         await remote.start();
-        devices.set(deviceId, remote);
+        
+        // Store the remote
+        devices.set(deviceId, { 
+            remote: remote, 
+            cert: cert,
+            host: host,
+            connected: true,
+            lastActivity: Date.now()
+        });
+        
+        console.log(`[${deviceId}] ✓ Connected successfully`);
         
         res.json({
             success: true,
-            message: 'Connected successfully'
+            message: 'Connected successfully',
+            deviceId: deviceId
         });
         
     } catch (error) {
-        console.error('Connection error:', error);
+        console.error(`✗ CONNECTION FAILED:`, error.message);
+        console.error('Error details:', error);
+        
         res.status(500).json({
             success: false,
-            error: error.message
+            error: error.message || 'Connection failed',
+            details: error.stack
         });
     }
 });
 
 app.post('/disconnect', async (req, res) => {
+    console.log('\n=== DISCONNECT REQUEST ===');
+    
     try {
-        const { deviceId } = req.body;
+        const deviceId = req.body.deviceId;
         
-        const remote = devices.get(deviceId);
-        if (remote) {
-            await remote.stop();
+        if (!deviceId) {
+            throw new Error('Missing required parameter: deviceId');
+        }
+        
+        console.log(`Device ID: ${deviceId}`);
+        
+        const deviceState = devices.get(deviceId);
+        if (deviceState && deviceState.remote) {
+            console.log(`[${deviceId}] Disconnecting...`);
             devices.delete(deviceId);
+            console.log(`[${deviceId}] ✓ Disconnected`);
+        } else {
+            console.log(`[${deviceId}] Not connected, nothing to do`);
         }
         
         res.json({
             success: true,
-            message: 'Disconnected'
+            message: 'Disconnected',
+            deviceId: deviceId
         });
         
     } catch (error) {
@@ -163,27 +371,40 @@ app.post('/disconnect', async (req, res) => {
 // Send key command
 app.post('/key', async (req, res) => {
     try {
-        const { deviceId, keyCode, keyName } = req.body;
+        const deviceId = req.body.deviceId;
+        const keyCode = parseInt(req.body.keyCode); // Convert string to integer
+        const keyName = req.body.keyName;
         
-        const remote = devices.get(deviceId);
-        if (!remote) {
-            throw new Error('Device not connected');
+        if (!deviceId || isNaN(keyCode)) {
+            throw new Error('Missing or invalid required parameters: deviceId, keyCode');
         }
         
-        console.log(`Sending key to ${deviceId}: ${keyName} (${keyCode})`);
+        const deviceState = devices.get(deviceId);
+        if (!deviceState || !deviceState.remote) {
+            throw new Error(`Device ${deviceId} not connected. Run /connect first.`);
+        }
         
-        await remote.sendKey(keyCode);
+        console.log(`[${deviceId}] Sending key: ${keyName || 'unknown'} (${keyCode})`);
+        
+        const remote = deviceState.remote;
+        deviceState.lastActivity = Date.now();
+        
+        // Send key with SHORT direction
+        await remote.sendKey(keyCode, RemoteDirection.SHORT);
+        
+        console.log(`[${deviceId}] ✓ Key sent`);
         
         res.json({
             success: true,
-            message: `Sent key: ${keyName}`
+            message: `Sent key: ${keyName}`,
+            deviceId: deviceId
         });
         
     } catch (error) {
         console.error('Send key error:', error);
         res.status(500).json({
             success: false,
-            error: error.message
+            error: error.message || 'Failed to send key'
         });
     }
 });
@@ -191,27 +412,38 @@ app.post('/key', async (req, res) => {
 // Launch app
 app.post('/app/launch', async (req, res) => {
     try {
-        const { deviceId, appUrl } = req.body;
+        const deviceId = req.body.deviceId;
+        const appUrl = req.body.appUrl;
         
-        const remote = devices.get(deviceId);
-        if (!remote) {
-            throw new Error('Device not connected');
+        if (!deviceId || !appUrl) {
+            throw new Error('Missing required parameters: deviceId, appUrl');
         }
         
-        console.log(`Launching app on ${deviceId}: ${appUrl}`);
+        const deviceState = devices.get(deviceId);
+        if (!deviceState || !deviceState.remote) {
+            throw new Error(`Device ${deviceId} not connected`);
+        }
+        
+        console.log(`[${deviceId}] Launching app: ${appUrl}`);
+        
+        const remote = deviceState.remote;
+        deviceState.lastActivity = Date.now();
         
         await remote.sendAppLink(appUrl);
         
+        console.log(`[${deviceId}] ✓ App launched`);
+        
         res.json({
             success: true,
-            message: 'App launched'
+            message: 'App launched',
+            deviceId: deviceId
         });
         
     } catch (error) {
         console.error('Launch app error:', error);
         res.status(500).json({
             success: false,
-            error: error.message
+            error: error.message || 'Failed to launch app'
         });
     }
 });
@@ -219,23 +451,24 @@ app.post('/app/launch', async (req, res) => {
 // Send text
 app.post('/text', async (req, res) => {
     try {
-        const { deviceId, text } = req.body;
+        const deviceId = req.body.deviceId;
+        const text = req.body.text;
         
-        const remote = devices.get(deviceId);
-        if (!remote) {
-            throw new Error('Device not connected');
+        if (!deviceId || !text) {
+            throw new Error('Missing required parameters: deviceId, text');
         }
         
-        console.log(`Sending text to ${deviceId}: ${text}`);
-        
-        // Send text character by character
-        for (const char of text) {
-            await remote.sendText(char);
+        const deviceState = devices.get(deviceId);
+        if (!deviceState || !deviceState.remote) {
+            throw new Error(`Device ${deviceId} not connected`);
         }
+        
+        console.log(`[${deviceId}] Text input requested: ${text}`);
         
         res.json({
             success: true,
-            message: 'Text sent'
+            message: 'Text input not fully implemented in androidtv-remote library',
+            deviceId: deviceId
         });
         
     } catch (error) {
@@ -250,15 +483,16 @@ app.post('/text', async (req, res) => {
 // Get status
 app.get('/status/:deviceId', async (req, res) => {
     try {
-        const { deviceId } = req.params;
+        const deviceId = req.params.deviceId;
         
-        const remote = devices.get(deviceId);
-        const connected = remote && remote.isConnected();
+        const deviceState = devices.get(deviceId);
+        const connected = deviceState && deviceState.remote && deviceState.connected;
         
         res.json({
             success: true,
             connected: connected,
-            deviceId: deviceId
+            deviceId: deviceId,
+            lastActivity: deviceState ? deviceState.lastActivity : null
         });
         
     } catch (error) {
@@ -272,49 +506,137 @@ app.get('/status/:deviceId', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
+    const allDevices = Array.from(devices.keys());
+    const connectedCount = allDevices.filter(k => !k.startsWith('pairing_')).length;
+    const pairingCount = allDevices.filter(k => k.startsWith('pairing_')).length;
+    
     res.json({
         status: 'ok',
-        connectedDevices: devices.size,
-        uptime: process.uptime()
+        connectedDevices: connectedCount,
+        pairingInProgress: pairingCount,
+        totalDevices: allDevices.length,
+        uptime: Math.floor(process.uptime())
     });
 });
 
-// Start server
-app.listen(PORT, () => {
-    console.log('='.repeat(60));
-    console.log('Android TV Remote Bridge Server');
-    console.log('='.repeat(60));
-    console.log(`Server running on port ${PORT}`);
+// Unpair device
+app.post('/unpair', async (req, res) => {
+    console.log('\n=== UNPAIR REQUEST ===');
+    
+    try {
+        const deviceId = req.body.deviceId;
+        
+        if (!deviceId) {
+            throw new Error('Missing required parameter: deviceId');
+        }
+        
+        console.log(`Device ID: ${deviceId}`);
+        
+        // Remove from active devices
+        devices.delete(deviceId);
+        
+        // Also remove any pairing in progress
+        devices.delete(`pairing_${deviceId}`);
+        
+        console.log(`[${deviceId}] ✓ Unpaired and removed from bridge`);
+        console.log(`[${deviceId}] Note: Also clear pairing on TV to fully reset`);
+        
+        res.json({
+            success: true,
+            message: 'Unpaired from bridge. Also clear Android TV Remote Service data on TV.',
+            deviceId: deviceId
+        });
+        
+    } catch (error) {
+        console.error('Unpair error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// List devices (debugging)
+app.get('/devices', (req, res) => {
+    const deviceList = Array.from(devices.entries()).map(([deviceId, state]) => ({
+        deviceId: deviceId,
+        type: deviceId.startsWith('pairing_') ? 'pairing' : 'connected',
+        host: state.host || 'unknown',
+        connected: state.connected || false,
+        lastActivity: state.lastActivity || null
+    }));
+    
+    res.json({
+        devices: deviceList,
+        count: deviceList.length
+    });
+});
+
+// Test endpoint
+app.post('/test', (req, res) => {
+    console.log('\n=== TEST ENDPOINT ===');
+    console.log('Body received:', req.body);
+    console.log('Headers:', req.headers);
+    
+    res.json({
+        success: true,
+        message: 'Test successful',
+        receivedBody: req.body,
+        bodyKeys: Object.keys(req.body)
+    });
+});
+
+// Start server - Listen on all interfaces
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log('='.repeat(70));
+    console.log('  Android TV Remote Bridge Server');
+    console.log('='.repeat(70));
+    console.log(`  Status: RUNNING`);
+    console.log(`  Port: ${PORT}`);
+    console.log(`  Listening: 0.0.0.0:${PORT} (all interfaces)`);
+    console.log(`  Node Version: ${process.version}`);
     console.log('');
-    console.log('Endpoints:');
-    console.log(`  POST http://localhost:${PORT}/pair/start`);
-    console.log(`  POST http://localhost:${PORT}/pair/complete`);
-    console.log(`  POST http://localhost:${PORT}/connect`);
-    console.log(`  POST http://localhost:${PORT}/disconnect`);
-    console.log(`  POST http://localhost:${PORT}/key`);
-    console.log(`  POST http://localhost:${PORT}/app/launch`);
-    console.log(`  POST http://localhost:${PORT}/text`);
-    console.log(`  GET  http://localhost:${PORT}/status/:deviceId`);
-    console.log(`  GET  http://localhost:${PORT}/health`);
+    console.log('  Endpoints:');
+    console.log(`    POST /pair/start       - Start pairing`);
+    console.log(`    POST /pair/complete    - Complete pairing with code`);
+    console.log(`    POST /connect          - Connect to paired device`);
+    console.log(`    POST /disconnect       - Disconnect`);
+    console.log(`    POST /key              - Send key`);
+    console.log(`    POST /app/launch       - Launch app`);
+    console.log(`    POST /text             - Send text`);
+    console.log(`    GET  /status/:id       - Device status`);
+    console.log(`    GET  /health           - Health check`);
+    console.log(`    GET  /devices          - List devices`);
+    console.log(`    POST /test             - Test body parsing`);
     console.log('');
-    console.log('Configure Hubitat driver to use this bridge:');
-    console.log(`  Bridge URL: http://YOUR_SERVER_IP:${PORT}`);
-    console.log('='.repeat(60));
+    console.log('  Configure Hubitat:');
+    console.log(`    Bridge Server IP: YOUR_QNAP_IP`);
+    console.log(`    Bridge Server Port: ${PORT}`);
+    console.log('='.repeat(70));
+    console.log('');
 });
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
-    console.log('\nShutting down...');
+    console.log('\n\nShutting down gracefully...');
     
-    // Disconnect all devices
-    for (const [deviceId, remote] of devices.entries()) {
-        try {
-            console.log(`Disconnecting ${deviceId}`);
-            await remote.stop();
-        } catch (error) {
-            console.error(`Error disconnecting ${deviceId}:`, error);
-        }
-    }
+    // Close server
+    server.close(() => {
+        console.log('HTTP server closed');
+    });
     
+    // Clear all devices
+    devices.clear();
+    
+    console.log('Shutdown complete');
     process.exit(0);
+});
+
+// Error handlers
+process.on('uncaughtException', (error) => {
+    console.error('UNCAUGHT EXCEPTION:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('UNHANDLED REJECTION:', reason);
 });
