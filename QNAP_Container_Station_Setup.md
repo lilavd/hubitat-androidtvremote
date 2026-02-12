@@ -45,7 +45,7 @@ This guide shows you how to deploy the Android TV Bridge on QNAP NAS using **Con
   "dependencies": {
     "express": "^4.18.2",
     "body-parser": "^1.20.2",
-    "androidtvremote2": "^0.3.0"
+    "androidtvremote": "^0.3.0"
   },
   "scripts": {
     "start": "node androidtv-bridge.js"
